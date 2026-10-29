@@ -194,7 +194,11 @@ function calcRec(p) {
 function targets(date) {
   const type = dayType(date);
   if (type === 'fasting' && S.fasting.mode === 'custom') return { ...pickN(S.fasting), src: 'Fasting-day targets' };
-  if (S.goalSource === 'plan') { const pv = planFor(date); if (pv) return { ...roundN(planTotals(pv.version)), src: 'Diet plan · ' + pv.plan.name }; }
+  if (S.goalSource === 'plan') {
+    const pv = planFor(date);
+    if (pv) return { ...roundN(planTotals(pv.version)), src: 'Diet plan · ' + pv.plan.name };
+    return { ...zeroN(), src: 'No diet plan yet — import it in the Plan tab' };
+  }
   if (S.goalSource !== 'custom') { const r = calcRec(S.profile); if (r) return { ...pickN(r), src: 'Recommended' }; }
   return { ...pickN(S.custom), src: 'Custom targets' };
 }
@@ -1132,7 +1136,7 @@ function renderGoals() {
     <div class="seg">${[['plan', 'Diet plan'], ['rec', 'Recommended'], ['custom', 'Custom']].map(([k, l]) => `<button data-gs="${k}" class="${S.goalSource === k ? 'on' : ''}">${l}</button>`).join('')}</div>
     <table class="t" style="margin-top:10px"><tr><th></th><th>kcal</th><th>P</th><th>C</th><th>F</th><th>Fib</th></tr>${row('Plan', planT)}${row('Recomm.', rec)}${row('Custom', S.custom)}</table>
     ${S.goalSource === 'custom' ? `<div class="grid5" style="margin-top:8px">${KEYS.map(k => `<div><label class="f">${k === 'kcal' ? 'kcal' : k === 'fib' ? 'Fiber' : LABEL[k]}</label><input type="number" inputmode="decimal" data-cu="${k}" value="${S.custom[k]}"></div>`).join('')}</div>` : ''}
-    ${S.goalSource === 'plan' && !planT ? '<p class="small over">No plan imported yet — using Recommended until you add one in the Plan tab.</p>' : ''}
+    ${S.goalSource === 'plan' && !planT ? '<p class="small over">No plan imported yet — import it in the Plan tab.</p>' : ''}
   </div>
   <div class="card"><h3>About you</h3>
     <div class="seg">${['male', 'female'].map(x => `<button data-sex="${x}" class="${p.sex === x ? 'on' : ''}">${x === 'male' ? 'Male' : 'Female'}</button>`).join('')}</div>
