@@ -118,7 +118,7 @@ function searchFoods(q, limit = 25) {
   return scored.sort((a, b) => b[0] - a[0]).slice(0, limit).map(x => x[1]);
 }
 function catalogText() {
-  const line = f => `${f.id} | ${f.name} | ${(f.aliases || []).slice(0, 4).join(', ')} | ${f.state} | ${Object.entries(f.u || {}).map(([k, v]) => k + '=' + v).join(' ')}`;
+  const line = f => `${f.id}|${f.name}${f.aliases && f.aliases.length ? '|' + f.aliases.slice(0, 3).join(',') : ''}`;
   return allFoods().map(line).join('\n');
 }
 function ensureMyFood(food, name) {
@@ -280,6 +280,10 @@ function renderToday() {
     <div class="daytype">${['normal', 'veg', 'fasting'].map(t => `<button class="chip ${type === t ? 'on' : ''}" data-dt="${t}">${t === 'normal' ? 'Normal' : t === 'veg' ? 'Veg' : 'Fast'}</button>`).join('')}</div>
   </div>`;
   if (!standalone && ios && !S.settings.hideInstall) html += `<div class="banner">Install on your iPhone: tap <b>Share</b> → <b>Add to Home Screen</b>. <a href="#" id="hideInst" class="small">Hide</a></div>`;
+  const pend = (S.pending || []);
+  if (pend.length) html += `<div class="card"><h3>Waiting to log</h3>${pend.map(p => `<div class="list-item"><div class="grow"><div class="small">${p.hasAudio ? '🎤 Voice note' : '“' + esc((p.text || '').slice(0, 70)) + '”'}</div>
+    <div class="tiny muted">${esc(p.slot || '')} · ${fmtDate(p.date)} · ${p.status === 'ready' ? '<span class="left">ready</span>' : p.status === 'failed' ? '<span class="over">couldn’t read — ' + esc(p.error || '') + '</span>' : 'waiting for internet'}</div></div>
+    ${p.status === 'ready' ? `<button class="btn sm primary" data-prv="${p.id}">Review</button>` : p.status === 'failed' ? '' : `<button class="btn sm" data-pretry="1">Retry</button>`}<button class="iconbtn" data-pdel="${p.id}">✕</button></div>`).join('')}</div>`;
   if (!S.settings.apiKey) html += `<div class="banner">Add your free Gemini key in <a href="#" id="toKey">More → Settings</a> to use voice, photos and AI estimates.</div>`;
   if (entriesCount > 20 && Date.now() - (S.settings.lastBackup || 0) > 14 * 864e5) html += `<div class="banner">It's been a while since your last backup. <a href="#" id="doBackup">Back up now</a></div>`;
   html += `<div class="card">
@@ -327,6 +331,9 @@ function renderToday() {
   if ($('#toKey', v)) $('#toKey', v).onclick = e => { e.preventDefault(); go('more'); };
   if ($('#doBackup', v)) $('#doBackup', v).onclick = e => { e.preventDefault(); exportData(); };
   $('#whatNow', v).onclick = openWhatNow;
+  $$('[data-prv]', v).forEach(b => b.onclick = () => reviewPending(b.dataset.prv));
+  $$('[data-pdel]', v).forEach(b => b.onclick = () => dropPending(b.dataset.pdel));
+  $$('[data-pretry]', v).forEach(b => b.onclick = () => { toast('Trying…'); processPending(); });
   $$('[data-add]', v).forEach(b => b.onclick = () => openAdd(b.dataset.add));
   $$('[data-entry]', v).forEach(el => el.onclick = () => openEntry(el.dataset.entry));
   $$('[data-logplan]', v).forEach(b => b.onclick = () => {
@@ -393,11 +400,12 @@ function renderReview() {
   let html = `<div class="row between"><h2>Review</h2>
     <select id="rvSlot" style="width:auto">${slotNames().map(s => `<option ${s === R.slot ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></div>`;
   if (R.transcript) html += `<p class="small muted" style="margin:-4px 0 6px">“${esc(R.transcript)}”</p>`;
+  if (R.local) html += `<div class="row between small" style="margin:-2px 0 8px"><span class="muted">⚡ Matched instantly on your phone</span><button class="btn sm" id="rvAI">✨ Check with AI</button></div>`;
   if (R.questions && R.questions.length) html += `<div class="banner small">${R.questions.map(esc).join('<br>')}</div>`;
   if (!R.items.length) html += `<div class="empty">Nothing yet — add foods below.</div>`;
   html += R.items.map(ri => {
     const n = riN(ri);
-    const states = ri.kind === 'food' ? (canConvert(ri.food) ? [ri.food.state, otherState(ri.food)] : [ri.state]) : [];
+    const states = ri.kind === 'food' && canConvert(ri.food) ? [ri.food.state, otherState(ri.food)] : [];
     return `<div class="ritem ${ri.on ? '' : 'off'}" data-k="${ri.key}">
       <div class="top"><input type="checkbox" data-on ${ri.on ? 'checked' : ''} style="width:20px;height:20px;margin-top:3px">
         <div class="grow"><input type="text" data-name value="${esc(ri.name)}" style="padding:4px 6px;font-weight:600;border-color:transparent;background:transparent">
@@ -443,6 +451,13 @@ function renderReview() {
       save(); toast('Saved to favorites');
     };
     $('#rvSave', s).onclick = saveReview;
+    if ($('#rvAI', s)) $('#rvAI', s).onclick = async () => {
+      const text = R.transcript; R.items = []; R.local = false;
+      if (!navigator.onLine) return queuePending({ kind: 'text', text, slot: R.slot });
+      $('#sheet').innerHTML = spinner('Checking with AI…');
+      try { handleParsed(await AI.parseMeal(text, aiCtx()), () => R, text); }
+      catch (e) { if (e.offline) return queuePending({ kind: 'text', text, slot: R.slot }); aiError(e); }
+    };
   });
 }
 function serializeRI(ri) {
@@ -466,6 +481,7 @@ function saveReview() {
     if (R.editId) { const i = d.entries.findIndex(x => x.id === R.editId); if (i >= 0) { e.id = R.editId; e.t = d.entries[i].t; d.entries[i] = e; continue; } }
     d.entries.push(e);
   }
+  if (R.pendingId) { S.pending = (S.pending || []).filter(x => x.id !== R.pendingId); }
   save(); closeSheet(); R = null; UI.tab = 'today'; render(); toast('Logged');
 }
 
@@ -555,19 +571,190 @@ function handleParsed(res, target, text) {
   renderReview();
 }
 
-/* Voice */
-const REC = { stream: null, rec: null, chunks: [], timer: null, t0: 0 };
+/* ---------- Fast local matcher (no AI, works offline) ---------- */
+const NUMW = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, fifteen: 15, twenty: 20, half: 0.5, quarter: 0.25, couple: 2, few: 3 };
+const UNITW = { g: 'g', gm: 'g', gms: 'g', gram: 'g', grams: 'g', grm: 'g', kg: 'kg', oz: 'oz', ounce: 'oz', ounces: 'oz', ml: 'ml', piece: 'piece', pieces: 'piece', pc: 'piece', pcs: 'piece', katori: 'katori', katoris: 'katori', bowl: 'katori', bowls: 'katori', vati: 'katori', wati: 'katori', cup: 'cup', cups: 'cup', tbsp: 'tbsp', tablespoon: 'tbsp', tablespoons: 'tbsp', spoon: 'tbsp', spoons: 'tbsp', tsp: 'tsp', teaspoon: 'tsp', teaspoons: 'tsp', scoop: 'scoop', scoops: 'scoop', slice: 'slice', slices: 'slice', plate: 'plate', plates: 'plate', glass: 'glass', glasses: 'glass', can: 'can', cans: 'can', serving: 'serving', servings: 'serving' };
+const FILLER = new Set(['i', 'had', 'ate', 'have', 'eaten', 'eat', 'for', 'my', 'of', 'some', 'today', 'the', 'also', 'just', 'about', 'around', 'approx', 'approximately', 'roughly', 'like', 'in', 'at', 'weight', 'weighed', 'total', 'it', 'was', 'me', 'small', 'medium', 'large', 'big']);
+let FOODKEYS = null;
+function foodKeys() {
+  if (FOODKEYS && FOODKEYS.n === S.myFoods.length + ':' + (S.myFoods[0] && S.myFoods[0].id)) return FOODKEYS.map;
+  const map = new Map();
+  const add = (k, f) => { k = k.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim(); if (k.length >= 2) map.set(k, f); };
+  const names = f => { f.name.split(/[\/(]/).forEach(part => add(part.replace(/\)/g, ''), f)); add(f.name, f); };
+  FOODS.forEach(names);                                   // 1. library name parts ("milk" from "Milk (skim)")
+  FOODS.forEach(f => (f.aliases || []).forEach(a => add(a, f)));   // 2. explicit aliases win ("milk" → whole milk)
+  S.myFoods.slice().reverse().forEach(f => { names(f); (f.aliases || []).forEach(a => add(a, f)); });  // 3. your own foods win over everything
+  FOODKEYS = { n: S.myFoods.length + ':' + (S.myFoods[0] && S.myFoods[0].id), map };
+  return map;
+}
+function matchFood(q) {
+  const map = foodKeys();
+  const sing = w => w.replace(/(ies)$/, 'y').replace(/(es|s)$/, '');
+  if (map.has(q)) return map.get(q);
+  const qs = q.split(' ').map(sing).join(' ');
+  if (map.has(qs)) return map.get(qs);
+  const qw = qs.split(' ');
+  let best = null, bestLen = 0;
+  for (const [k, f] of map) {
+    const kw = k.split(' ').map(sing);
+    if (kw.every(w => qw.includes(w)) && kw.length > bestLen) { best = f; bestLen = kw.length; }
+  }
+  // accept only if at most one leftover descriptive word (e.g. "grilled")
+  return best && qw.length - bestLen <= 1 ? best : null;
+}
+function localParse(text) {
+  let t = ' ' + text.toLowerCase().replace(/[’']/g, '') + ' ';
+  if (/\b(made|recipe|cooked in|fried in|today is|fasting|fast day|upvas|vrat|veg day|same as|yesterday|instead|leftover)\b/.test(t)) return null;
+  let slot = null;
+  const sm = t.match(/\b(for|at|in)?\s*(breakfast|lunch|dinner|snacks?|mid ?morning|before bed|bedtime|upon waking|after waking|morning)\b/);
+  if (sm) { slot = mapSlot(sm[2].replace('bedtime', 'before bed').replace('after waking', 'upon waking').replace(/^morning$/, 'breakfast')); t = t.replace(sm[0], ' '); }
+  t = t.replace(/(\d)\s*(g|gm|gms|kg|ml|oz)\b/g, '$1 $2').replace(/(\d+)\s*\/\s*(\d+)/g, (m, a, b) => String(a / b));
+  const chunks = t.split(/,|;|\n|\.\s|\band\b|\bwith\b|\bplus\b|\+|&/).map(c => c.trim()).filter(Boolean);
+  if (!chunks.length) return null;
+  const items = [];
+  for (const ch of chunks) {
+    let qty = null, unit = null, state = null; const words = [];
+    for (const w of ch.split(/\s+/)) {
+      if (/^\d+(\.\d+)?$/.test(w)) { qty = (qty || 0) + parseFloat(w); continue; }
+      if (w in NUMW && qty === null) { qty = NUMW[w]; continue; }
+      if (w === 'and' || w === 'a' || w === 'an') continue;
+      if (UNITW[w] && !unit) { unit = UNITW[w]; continue; }
+      if (/^(raw|uncooked)$/.test(w)) { state = 'raw'; continue; }
+      if (/^(cooked|boiled)$/.test(w)) { state = 'cooked'; continue; }
+      if (w === 'dry') { state = 'dry'; continue; }
+      if (FILLER.has(w)) continue;
+      words.push(w.replace(/[^a-z0-9]/g, ''));
+    }
+    const q = words.filter(Boolean).join(' ');
+    if (!q) { if (qty !== null || unit) return null; continue; }
+    const food = matchFood(q);
+    if (!food) return null;
+    if (unit === 'kg') { unit = 'g'; qty = (qty || 1) * 1000; }
+    if (state && food.state === 'cooked' && state === 'raw') state = 'dry';
+    if (state && !canConvert(food)) state = null;
+    if (!unit) unit = qty !== null && food.u && food.u.piece ? 'piece' : defaultUnit(food);
+    if (qty === null) qty = unit === 'g' ? 100 : 1;
+    items.push(riFromFood(food, qty, unit, state || undefined));
+  }
+  return items.length ? { slot, items } : null;
+}
+
+/* ---------- Pending queue (when offline or the phone locks mid-request) ---------- */
+const IDB = {
+  db: null,
+  open() { return this.db || (this.db = new Promise((res, rej) => { const r = indexedDB.open('thali', 1); r.onupgradeneeded = () => r.result.createObjectStore('audio'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); })); },
+  async run(mode, fn) { const db = await this.open(); return new Promise((res, rej) => { const tx = db.transaction('audio', mode); const out = fn(tx.objectStore('audio')); tx.oncomplete = () => res(out && out.result); tx.onerror = () => rej(tx.error); }); },
+  put(k, v) { return this.run('readwrite', s => s.put(v, k)); },
+  get(k) { return this.run('readonly', s => s.get(k)); },
+  del(k) { return this.run('readwrite', s => s.delete(k)); }
+};
+async function queuePending(p) {
+  const item = Object.assign({ id: uid(), date: UI.date, created: Date.now(), status: 'waiting' }, p);
+  if (item.audio) { try { await IDB.put(item.id, item.audio); } catch (e) { console.warn(e); } delete item.audio; item.hasAudio = true; }
+  S.pending = S.pending || []; S.pending.push(item); save();
+  closeSheet(); UI.tab = 'today'; render();
+processPending();
+  toast('No connection — saved. It will finish automatically when you’re back online.', 4500);
+}
+let pendingBusy = false;
+async function processPending() {
+  if (pendingBusy || !S.settings.apiKey || !(S.pending || []).some(p => p.status === 'waiting')) return;
+  pendingBusy = true;
+  try {
+    for (const p of S.pending.filter(x => x.status === 'waiting')) {
+      try {
+        let res;
+        if (p.hasAudio) { const a = await IDB.get(p.id); if (!a) { p.status = 'failed'; continue; } res = await AI.parseAudio(a.b64, a.mime, aiCtx()); }
+        else res = await AI.parseMeal(p.text, aiCtx());
+        p.res = res; p.status = 'ready'; if (p.hasAudio) { IDB.del(p.id).catch(() => {}); p.hasAudio = false; p.text = res.transcript || ''; }
+        save();
+      } catch (e) { if (e.offline) break; p.status = 'failed'; p.error = e.message; save(); }
+    }
+  } finally { pendingBusy = false; if (UI.tab === 'today' && $('#sheetWrap').hidden) render(); }
+}
+function reviewPending(id) {
+  const p = (S.pending || []).find(x => x.id === id); if (!p) return;
+  R = { slot: p.slot || guessSlot(p.date), date: p.date, items: [], questions: [], transcript: '', pendingId: id };
+  handleParsed(p.res, () => R, p.text);
+}
+function dropPending(id) {
+  S.pending = (S.pending || []).filter(x => x.id !== id); IDB.del(id).catch(() => {}); save(); render();
+processPending();
+}
+window.addEventListener('online', () => processPending());
+
+/* ---------- Turning words into a review ---------- */
+async function processText(text, target, slotHint) {
+  const r = target();
+  const lp = localParse(text);
+  if (lp) {
+    if (lp.slot) r.slot = lp.slot;
+    r.items.push(...lp.items); r.transcript = text; r.local = true; r.questions = [];
+    return renderReview();
+  }
+  if (!S.settings.apiKey) return aiError(new Error('NO_KEY'));
+  if (!navigator.onLine) return queuePending({ kind: 'text', text, slot: r.slot });
+  $('#sheet').innerHTML = spinner('Working out the nutrition…');
+  try { handleParsed(await AI.parseMeal(text, aiCtx()), target, text); }
+  catch (e) { if (e.offline) return queuePending({ kind: 'text', text, slot: r.slot }); aiError(e); openType(target, text); }
+}
+
+/* Voice: iPhone on-device speech first (fast), Gemini audio as fallback */
+const REC = { stream: null, rec: null, chunks: [], timer: null, t0: 0, sr: null, listening: false };
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 function openVoice(target) {
-  openSheet(`<h2>Speak</h2><p class="small muted">Say what you ate, like “2 multigrain dosa with a katori of sambar for breakfast” or “150 g grilled chicken, raw weight”. You can also say “today is my fasting day”.</p>
-    <button class="mic" id="mic" aria-label="Record"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+  if (SR && S.settings.voiceMode !== 'gemini') return openVoiceLive(target);
+  return openVoiceRecord(target);
+}
+const MIC_SVG = `<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>`;
+function openVoiceLive(target) {
+  let finalText = '', listening = false;
+  openSheet(`<h2>Speak</h2><p class="small muted">Say what you ate, e.g. “2 roti, 1 katori dal and 8 almonds for lunch”. Tap again when done.</p>
+    <button class="mic" id="mic" aria-label="Speak">${MIC_SVG}</button>
     <p id="micState" class="small" style="text-align:center">Tap to start</p>
-    <details style="margin-top:10px"><summary class="small muted">Prefer the keyboard mic?</summary><p class="small muted">Use “Describe” and tap the 🎤 on your iPhone keyboard.</p></details>`, s => {
+    <textarea id="live" placeholder="Your words appear here — you can fix them before logging" style="min-height:70px"></textarea>
+    <div class="grid2" style="margin-top:8px"><button class="btn" id="useRec">Use Gemini listening</button><button class="btn primary" id="go">Log it</button></div>`, s => {
+    const live = $('#live', s), st = $('#micState', s), mic = $('#mic', s);
+    const stopUI = () => { listening = false; REC.listening = false; mic.classList.remove('rec'); st.textContent = 'Tap to talk again'; };
+    const start = () => {
+      const rec = new SR(); REC.sr = rec;
+      rec.lang = S.settings.voiceLang || 'en-IN'; rec.continuous = true; rec.interimResults = true;
+      rec.onresult = e => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) { const tr = e.results[i][0].transcript; if (e.results[i].isFinal) finalText += (finalText ? ' ' : '') + tr.trim(); else interim += tr; }
+        live.value = (finalText + ' ' + interim).trim();
+      };
+      rec.onerror = e => {
+        if (['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'].includes(e.error)) {
+          stopUI(); S.settings.voiceMode = 'gemini'; save();
+          toast('iPhone speech isn’t available in the app — switching to Gemini listening.', 4000);
+          openVoiceRecord(target);
+        } else if (e.error === 'network') { stopUI(); st.textContent = 'Speech needs internet — type below or use Describe.'; }
+      };
+      rec.onend = () => { if (listening) { try { rec.start(); } catch (e) { stopUI(); } } else stopUI(); };
+      try { rec.start(); listening = true; REC.listening = true; mic.classList.add('rec'); st.textContent = 'Listening… tap to finish'; }
+      catch (e) { stopUI(); openVoiceRecord(target); }
+    };
+    mic.onclick = () => {
+      if (listening) { listening = false; try { REC.sr.stop(); } catch (e) {} stopUI(); finalText = live.value.trim(); setTimeout(() => { if (live.value.trim()) $('#go', s).click(); }, 350); return; }
+      finalText = live.value.trim(); start();
+    };
+    $('#go', s).onclick = () => { const text = live.value.trim(); if (!text) return toast('Say or type what you ate'); listening = false; try { REC.sr && REC.sr.stop(); } catch (e) {} processText(text, target); };
+    $('#useRec', s).onclick = () => { listening = false; try { REC.sr && REC.sr.stop(); } catch (e) {} openVoiceRecord(target); };
+    start();
+  });
+}
+function openVoiceRecord(target) {
+  openSheet(`<h2>Speak</h2><p class="small muted">Gemini listens to the recording — slower, but best for mixed Gujarati/Hindi food names. You can also say “today is my fasting day”.</p>
+    <button class="mic" id="mic" aria-label="Record">${MIC_SVG}</button>
+    <p id="micState" class="small" style="text-align:center">Tap to start</p>
+    ${SR ? '<button class="btn block ghost" id="useLive">Use iPhone speech (faster)</button>' : ''}`, s => {
+    if ($('#useLive', s)) $('#useLive', s).onclick = () => { S.settings.voiceMode = 'live'; save(); openVoiceLive(target); };
     $('#mic', s).onclick = async () => {
       if (REC.rec && REC.rec.state === 'recording') { stopRecording(); return; }
       if (!S.settings.apiKey) return aiError(new Error('NO_KEY'));
-      try {
-        REC.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (e) { toast('Microphone permission was denied. Allow it in iPhone Settings → Safari → Microphone.', 5000); return; }
+      try { REC.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch (e) { toast('Microphone permission was denied. Allow it in iPhone Settings → Safari → Microphone.', 5000); return; }
       REC.chunks = [];
       REC.rec = new MediaRecorder(REC.stream);
       REC.rec.ondataavailable = e => e.data.size && REC.chunks.push(e.data);
@@ -577,11 +764,13 @@ function openVoice(target) {
         if (REC.cancel) { REC.cancel = false; return; }
         const blob = new Blob(REC.chunks, { type: REC.rec.mimeType || 'audio/mp4' });
         $('#sheet').innerHTML = spinner('Listening & working out the nutrition…');
+        const audio = await audioToB64(blob);
+        const slot = target().slot;
+        if (!navigator.onLine) return queuePending({ kind: 'audio', audio, slot });
         try {
-          const { b64, mime } = await audioToB64(blob);
-          const res = await AI.parseAudio(b64, mime, aiCtx());
+          const res = await AI.parseAudio(audio.b64, audio.mime, aiCtx());
           handleParsed(res, target, res.transcript);
-        } catch (e) { aiError(e); openVoice(target); }
+        } catch (e) { if (e.offline) return queuePending({ kind: 'audio', audio, slot }); aiError(e); openVoiceRecord(target); }
       };
       REC.rec.start(); REC.t0 = Date.now();
       $('#mic', s).classList.add('rec');
@@ -591,6 +780,7 @@ function openVoice(target) {
 }
 function stopRecording(cancel) {
   if (cancel) REC.cancel = true;
+  try { if (REC.sr && REC.listening) { REC.listening = false; REC.sr.abort(); } } catch (e) {}
   try { if (REC.rec && REC.rec.state === 'recording') REC.rec.stop(); else { REC.stream && REC.stream.getTracks().forEach(t => t.stop()); REC.stream = null; } } catch (e) {}
 }
 async function audioToB64(blob) {
@@ -625,18 +815,13 @@ function bufToB64(buf) {
 }
 
 /* Type / describe */
-function openType(target) {
+function openType(target, prefill) {
   openSheet(`<h2>Describe what you ate</h2>
-    <textarea id="txt" placeholder="e.g. 2 rotis, 1 katori guvar sabzi made with ghee, 150 g grilled chicken (raw weight), 8 almonds"></textarea>
-    <p class="tiny muted">Tip: tap 🎤 on the keyboard to dictate. Say “cooked” or “raw” when it matters.</p>
-    <button class="btn primary block" id="go">Understand</button>`, s => {
+    <textarea id="txt" placeholder="e.g. 2 rotis, 1 katori guvar sabzi made with ghee, 150 g grilled chicken (raw weight), 8 almonds">${esc(prefill || '')}</textarea>
+    <p class="tiny muted">Tip: tap 🎤 on the keyboard to dictate. Simple lists (“2 roti, 1 katori dal”) log instantly, even offline.</p>
+    <button class="btn primary block" id="go">Log it</button>`, s => {
     $('#txt', s).focus();
-    $('#go', s).onclick = async () => {
-      const text = $('#txt', s).value.trim(); if (!text) return;
-      $('#sheet').innerHTML = spinner('Working out the nutrition…');
-      try { handleParsed(await AI.parseMeal(text, aiCtx()), target, text); }
-      catch (e) { aiError(e); openType(target); }
-    };
+    $('#go', s).onclick = () => { const text = $('#txt', s).value.trim(); if (text) processText(text, target); };
   });
 }
 
@@ -1004,6 +1189,7 @@ function renderPlan() {
     Object.keys(S.activePlans).forEach(k => { if (S.activePlans[k] === b.dataset.delp) S.activePlans[k] = null; });
     if (!S.activePlans.normal && S.plans[0]) S.activePlans.normal = S.plans[0].id;
     save(); render();
+processPending();
   });
 }
 function aiPlanToPlan(p) {
@@ -1270,6 +1456,9 @@ function renderMore() {
     <p class="small muted">Free from <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Stored only on this phone.</p>
     <input type="password" id="key" placeholder="Paste your key" value="${esc(st.apiKey)}" autocomplete="off">
     <div class="row between" style="margin-top:8px"><span class="tiny muted">${st.model ? 'Model: ' + esc(st.model) : 'Not set up yet'}</span><button class="btn primary sm" id="saveKey">Save & test</button></div></div>
+  <div class="card"><h3>Voice</h3>
+    <div class="seg">${[['live', 'iPhone speech (fast)'], ['gemini', 'Gemini listening']].map(([k, l]) => `<button data-vm="${k}" class="${(st.voiceMode || 'live') === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <p class="tiny muted">iPhone speech shows your words as you talk and common foods log instantly. Gemini listening is slower but better with Gujarati/Hindi dish names.</p></div>
   <div class="card"><h3>My Foods</h3><p class="small muted">${S.myFoods.length} saved — your dishes, scanned products and AI estimates. ${S.myFoods.filter(f => f.est).length ? `<b>${S.myFoods.filter(f => f.est).length} still estimated.</b>` : ''}</p>
     <div class="grid2"><button class="btn" id="myF">Open My Foods</button><button class="btn" id="newDish">+ New dish</button></div></div>
   <div class="card"><h3>Day types by weekday</h3>
@@ -1292,6 +1481,7 @@ function renderMore() {
     catch (e) { toast(e.message, 4000); }
     renderMore();
   };
+  $$('[data-vm]', v).forEach(b => b.onclick = () => { st.voiceMode = b.dataset.vm; save(); renderMore(); });
   $('#myF', v).onclick = openMyFoods;
   $('#newDish', v).onclick = () => openDish(() => { if (!R) R = { slot: guessSlot(UI.date), date: UI.date, items: [], questions: [] }; return R; });
   $$('[data-wd]', v).forEach(s => s.onchange = () => { st.weekdayTypes[s.dataset.wd] = s.value; save(); });
@@ -1355,6 +1545,7 @@ function importData() {
 load(); window.S = S;
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
-document.addEventListener('visibilitychange', () => { if (!document.hidden && UI.tab === 'today' && $('#sheetWrap').hidden) { const t = today(); if (UI.date !== t && UI._last === UI.date) UI.date = t; UI._last = UI.date; render(); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) processPending(); if (!document.hidden && UI.tab === 'today' && $('#sheetWrap').hidden) { const t = today(); if (UI.date !== t && UI._last === UI.date) UI.date = t; UI._last = UI.date; render(); } });
 UI._last = UI.date;
 render();
+processPending();

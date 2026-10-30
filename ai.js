@@ -21,26 +21,46 @@ const AI = (() => {
     return pool[0] || 'gemini-2.5-flash';
   }
 
+  // Gemini "thinking" adds seconds of delay; food parsing doesn't need it. Try the lowest setting the model accepts.
+  function thinkOptions(m) {
+    if (/gemini-2\.5/.test(m)) return [{ thinkingBudget: 0 }, null];
+    if (/gemini-([3-9]|\d\d)/.test(m)) return [{ thinkingLevel: 'minimal' }, { thinkingLevel: 'low' }, null];
+    return [null];
+  }
+  const offline = msg => Object.assign(new Error(msg), { offline: true });
   async function call(parts, { json = true, search = false, temperature = 0.2 } = {}) {
     if (!key()) throw new Error('NO_KEY');
-    const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature } };
-    if (json && !search) body.generationConfig.responseMimeType = 'application/json';
-    if (search) body.tools = [{ google_search: {} }];
-    let r;
-    try {
-      r = await fetch(`${BASE}/models/${model()}:generateContent?key=${encodeURIComponent(key())}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-      });
-    } catch (e) { throw new Error('No internet connection — AI features need internet.'); }
-    if (r.status === 429) throw new Error('Gemini free limit reached for the moment. Wait a minute and try again.');
-    if (!r.ok) {
-      let msg = ''; try { msg = (await r.json()).error.message; } catch (e) {}
-      throw new Error('Gemini error ' + r.status + (msg ? ': ' + msg.slice(0, 160) : ''));
+    const m = model();
+    const opts = thinkOptions(m);
+    const memo = (S.settings.thinkIdx = S.settings.thinkIdx || {});
+    let idx = Math.min(memo[m] || 0, opts.length - 1);
+    for (;;) {
+      const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature } };
+      if (json && !search) body.generationConfig.responseMimeType = 'application/json';
+      if (search) body.tools = [{ google_search: {} }];
+      if (opts[idx]) body.generationConfig.thinkingConfig = opts[idx];
+      const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 60000);
+      let r;
+      try {
+        r = await fetch(`${BASE}/models/${m}:generateContent?key=${encodeURIComponent(key())}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal
+        });
+      } catch (e) {
+        throw offline(e.name === 'AbortError' ? 'Gemini took too long — saved to try again.' : 'No connection — saved to try again.');
+      } finally { clearTimeout(to); }
+      if (r.status === 429) throw new Error('Gemini free limit reached for the moment. Wait a minute and try again.');
+      if (!r.ok) {
+        let msg = ''; try { msg = (await r.json()).error.message; } catch (e) {}
+        if (r.status === 400 && /think/i.test(msg) && idx < opts.length - 1) { idx++; memo[m] = idx; continue; }
+        if (r.status >= 500) throw offline('Gemini is busy — saved to try again.');
+        throw new Error('Gemini error ' + r.status + (msg ? ': ' + msg.slice(0, 160) : ''));
+      }
+      if (memo[m] !== idx) memo[m] = idx;
+      let j; try { j = await r.json(); } catch (e) { throw offline('Connection dropped — saved to try again.'); }
+      const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter(p => !p.thought).map(p => p.text || '').join('');
+      if (!json) return text;
+      return parseJSON(text);
     }
-    const j = await r.json();
-    const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('');
-    if (!json) return text;
-    return parseJSON(text);
   }
   function parseJSON(t) {
     try { return JSON.parse(t); } catch (e) {}
@@ -81,7 +101,7 @@ const AI = (() => {
   function ctxText(ctx) {
     return `SLOTS: ${JSON.stringify(ctx.slots)}
 Current local time: ${ctx.time}. Today's day type: ${ctx.dayType}.
-CATALOG (id | name | also called | base state | unit grams):
+CATALOG (id|name|also called):
 ${ctx.catalog}`;
   }
 
