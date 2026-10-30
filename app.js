@@ -599,8 +599,11 @@ function matchFood(q) {
     const kw = k.split(' ').map(sing);
     if (kw.every(w => qw.includes(w)) && kw.length > bestLen) { best = f; bestLen = kw.length; }
   }
-  // accept only if at most one leftover descriptive word (e.g. "grilled")
-  return best && qw.length - bestLen <= 1 ? best : null;
+  // accept only if every leftover word is a harmless descriptor (e.g. "grilled chicken breast")
+  if (!best) return null;
+  const DESC = new Set(['grilled', 'roasted', 'fried', 'steamed', 'baked', 'plain', 'homemade', 'home', 'made', 'fresh', 'hot', 'cold', 'warm', 'whole', 'organic', 'frozen', 'regular', 'normal', 'boneless', 'skinless', 'chopped', 'sliced', 'toasted', 'my', 'usual']);
+  const bestKey = [...map].find(([k, f]) => f === best && k.split(' ').map(sing).every(w => qw.includes(w)) && k.split(' ').length === bestLen)[0].split(' ').map(sing);
+  return qw.every(w => bestKey.includes(w) || DESC.has(w)) ? best : null;
 }
 function localParse(text) {
   let t = ' ' + text.toLowerCase().replace(/[’']/g, '') + ' ';
